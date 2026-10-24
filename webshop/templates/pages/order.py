@@ -5,6 +5,7 @@ import frappe
 from frappe import _
 
 from webshop.webshop.doctype.webshop_settings.webshop_settings import show_attachments
+from webshop.webshop.portal.payment import is_payable
 
 
 def get_context(context):
@@ -25,6 +26,22 @@ def get_context(context):
 
 	context.enabled_checkout = frappe.get_doc("Webshop Settings").enable_checkout
 
+	# PR-Foundry/framework#182 + #183 (fork marker). The Pay affordance is decided HERE, by the
+	# same predicate the pay endpoint enforces, instead of by a per-doctype condition in the
+	# template. The old template test was
+	#     enabled_checkout and (doc.doctype != "Sales Invoice" or doc.outstanding_amount > 0)
+	# whose short-circuiting `or` meant the paid check only ever ran for Sales Invoice -- a fully
+	# paid Sales Order kept a working Pay button. is_payable() asks erpnext what it would charge,
+	# so the button is offered exactly when a non-zero Payment Request would be raised.
+	context.show_pay_button = bool(context.enabled_checkout) and is_payable(context.doc)
+
+	# PR-Foundry/framework#109 (fork marker). Pay is a form POST, and frappe refuses a POST from
+	# a logged-in session without this token. Read from the session here (creating it if the
+	# session has none yet) rather than relying on the page's <!-- csrf_token --> script, so the
+	# form works with JavaScript off. The page is no_cache, so the token is this session's.
+	if context.show_pay_button:
+		context.pay_csrf_token = frappe.sessions.get_csrf_token()
+
 	default_print_format = frappe.db.get_value(
 		"Property Setter",
 		dict(property="default_print_format", doc_type=frappe.form_dict.doctype),
@@ -40,17 +57,23 @@ def get_context(context):
 
 	if context.doc.get("customer"):
 		# check for the loyalty program of the customer
-		customer_loyalty_program = frappe.db.get_value(
-			"Customer", context.doc.customer, "loyalty_program"
-		)
+		customer_loyalty_program = frappe.db.get_value("Customer", context.doc.customer, "loyalty_program")
 		if customer_loyalty_program:
 			from erpnext.accounts.doctype.loyalty_program.loyalty_program import (
 				get_loyalty_program_details_with_points,
 			)
 
-			loyalty_program_details = get_loyalty_program_details_with_points(
-				context.doc.customer, customer_loyalty_program
-			)
+			from webshop.webshop.shopping_cart.cart import system_permissions
+
+			# PR-Foundry/framework#308: erpnext #58787/#59100 made this whitelisted function
+			# require Customer read, which a portal customer never holds, so every order page of
+			# a customer with a loyalty program rendered "Not Permitted" (and lost its Pay
+			# button). has_website_permission above has already established that this document
+			# is the caller's own, so the read of its own customer's points runs elevated.
+			with system_permissions():
+				loyalty_program_details = get_loyalty_program_details_with_points(
+					context.doc.customer, customer_loyalty_program
+				)
 			context.available_loyalty_points = int(loyalty_program_details.get("loyalty_points"))
 
 	# show Make Purchase Invoice button based on permission
